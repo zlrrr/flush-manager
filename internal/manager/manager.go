@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zlrrr/flush-manager/internal/logger"
 	"github.com/zlrrr/flush-manager/internal/process"
 	"github.com/zlrrr/flush-manager/internal/watcher"
 )
@@ -30,6 +31,8 @@ type Manager struct {
 
 // New creates a new Manager instance
 func New(config Config) (*Manager, error) {
+	logger.Info("Initializing manager with command: %s", config.Command)
+
 	if config.Command == "" {
 		return nil, fmt.Errorf("command cannot be empty")
 	}
@@ -42,6 +45,7 @@ func New(config Config) (*Manager, error) {
 	fw, err := watcher.NewFileWatcher(config.ConfigFilePath)
 	if err != nil {
 		cancel()
+		logger.Error("Failed to create file watcher: %v", err)
 		return nil, fmt.Errorf("failed to create file watcher: %w", err)
 	}
 
@@ -53,28 +57,34 @@ func New(config Config) (*Manager, error) {
 		cancel:         cancel,
 	}
 
+	logger.Info("Manager initialized successfully")
 	return m, nil
 }
 
 // Run starts the manager and blocks until it should exit
 func (m *Manager) Run() error {
+	logger.Info("Starting manager run loop...")
+
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	logger.Debug("Signal handlers registered for SIGINT and SIGTERM")
 
 	// Start the child process
 	if err := m.processManager.Start(m.ctx); err != nil {
+		logger.Error("Failed to start child process: %v", err)
 		return fmt.Errorf("failed to start child process: %w", err)
 	}
 
-	fmt.Printf("Manager started, child process: %s\n", m.config.Command)
+	logger.Info("Manager started, child process: %s", m.config.Command)
 
 	// Start file watcher
 	if err := m.fileWatcher.Start(m.ctx); err != nil {
+		logger.Error("Failed to start file watcher: %v", err)
 		return fmt.Errorf("failed to start file watcher: %w", err)
 	}
 	if m.config.ConfigFilePath != "" {
-		fmt.Printf("Watching config file: %s\n", m.config.ConfigFilePath)
+		logger.Info("Watching config file: %s", m.config.ConfigFilePath)
 	}
 
 	// Monitor process exit in background
@@ -88,20 +98,22 @@ func (m *Manager) Run() error {
 		exitChan <- exitResult{reason: reason, err: err}
 	}()
 
+	logger.Info("Entering main event loop")
+
 	// Main event loop
 	for {
 		select {
 		case sig := <-sigChan:
-			fmt.Printf("Received signal: %v, shutting down gracefully...\n", sig)
+			logger.Info("Received signal: %v, shutting down gracefully...", sig)
 			return m.shutdown()
 
 		case <-m.fileWatcher.Changes():
-			fmt.Println("Config file changed, restarting child process...")
+			logger.Info("Config file change detected, restarting child process...")
 			if err := m.processManager.Restart(m.ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to restart process: %v\n", err)
+				logger.Error("Failed to restart process: %v", err)
 				return err
 			}
-			fmt.Println("Child process restarted successfully")
+			logger.Info("Child process restarted successfully after config change")
 
 			// Restart the exit monitor goroutine
 			go func() {
@@ -112,18 +124,20 @@ func (m *Manager) Run() error {
 		case result := <-exitChan:
 			// If process was restarted by us, continue
 			if result.reason == process.ExitReasonRestart {
+				logger.Debug("Process exit was due to restart, continuing...")
 				continue
 			}
 
 			// If process exited abnormally, manager should exit too
 			if result.err != nil {
-				fmt.Fprintf(os.Stderr, "Child process exited with error: %v\n", result.err)
+				logger.Error("Child process exited with error: %v", result.err)
 			} else {
-				fmt.Println("Child process exited normally")
+				logger.Info("Child process exited normally")
 			}
 			return m.shutdown()
 
 		case <-m.ctx.Done():
+			logger.Debug("Context cancelled, shutting down...")
 			return m.shutdown()
 		}
 	}
@@ -131,22 +145,25 @@ func (m *Manager) Run() error {
 
 // shutdown performs graceful shutdown
 func (m *Manager) shutdown() error {
-	fmt.Println("Shutting down manager...")
+	logger.Info("Shutting down manager...")
 
 	// Cancel context to stop watchers
 	m.cancel()
+	logger.Debug("Context cancelled")
 
 	// Close file watcher
 	if err := m.fileWatcher.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error closing file watcher: %v\n", err)
+		logger.Error("Error closing file watcher: %v", err)
+	} else {
+		logger.Debug("File watcher closed")
 	}
 
 	// Stop child process gracefully
 	if err := m.processManager.Stop(10 * time.Second); err != nil {
-		fmt.Fprintf(os.Stderr, "Error stopping child process: %v\n", err)
+		logger.Error("Error stopping child process: %v", err)
 		return err
 	}
 
-	fmt.Println("Manager shutdown complete")
+	logger.Info("Manager shutdown complete")
 	return nil
 }

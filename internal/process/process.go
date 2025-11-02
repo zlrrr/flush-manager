@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"syscall"
 	"time"
+
+	"github.com/zlrrr/flush-manager/internal/logger"
 )
 
 // ExitReason represents why the process exited
@@ -50,6 +52,8 @@ func NewManager(command string, args []string) Manager {
 
 // Start starts the child process
 func (m *manager) Start(ctx context.Context) error {
+	logger.Info("Starting child process: %s %v", m.command, m.args)
+
 	m.cmd = exec.CommandContext(ctx, m.command, m.args...)
 	m.cmd.Stdout = os.Stdout
 	m.cmd.Stderr = os.Stderr
@@ -58,8 +62,11 @@ func (m *manager) Start(ctx context.Context) error {
 	}
 
 	if err := m.cmd.Start(); err != nil {
+		logger.Error("Failed to start process: %v", err)
 		return fmt.Errorf("failed to start process: %w", err)
 	}
+
+	logger.Info("Child process started with PID: %d", m.cmd.Process.Pid)
 
 	// Monitor process exit
 	go m.monitorProcess()
@@ -69,9 +76,11 @@ func (m *manager) Start(ctx context.Context) error {
 
 // Restart gracefully restarts the child process
 func (m *manager) Restart(ctx context.Context) error {
+	logger.Info("Restarting child process...")
 	m.restartFlag = true
 
 	if err := m.Stop(10 * time.Second); err != nil {
+		logger.Error("Failed to stop process during restart: %v", err)
 		return fmt.Errorf("failed to stop process: %w", err)
 	}
 
@@ -79,6 +88,7 @@ func (m *manager) Restart(ctx context.Context) error {
 	time.Sleep(100 * time.Millisecond)
 
 	m.restartFlag = false
+	logger.Info("Restarting child process after stop")
 	return m.Start(ctx)
 }
 
@@ -91,17 +101,25 @@ func (m *manager) Wait() (ExitReason, error) {
 // Stop stops the child process gracefully
 func (m *manager) Stop(timeout time.Duration) error {
 	if m.cmd == nil || m.cmd.Process == nil {
+		logger.Debug("No process to stop")
 		return nil
 	}
+
+	pid := m.cmd.Process.Pid
+	logger.Info("Stopping child process (PID: %d) with timeout: %v", pid, timeout)
 
 	// Send SIGTERM for graceful shutdown
 	if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		// Process might already be dead
 		if err.Error() != "os: process already finished" {
+			logger.Error("Failed to send SIGTERM to process: %v", err)
 			return err
 		}
+		logger.Debug("Process already finished")
 		return nil
 	}
+
+	logger.Debug("Sent SIGTERM to process (PID: %d), waiting for graceful shutdown...", pid)
 
 	// Wait for process to exit gracefully
 	done := make(chan error, 1)
@@ -112,9 +130,11 @@ func (m *manager) Stop(timeout time.Duration) error {
 
 	select {
 	case <-done:
+		logger.Info("Child process (PID: %d) stopped gracefully", pid)
 		return nil
 	case <-time.After(timeout):
 		// Force kill if timeout
+		logger.Info("Timeout waiting for graceful shutdown, sending SIGKILL to process (PID: %d)", pid)
 		return m.cmd.Process.Kill()
 	}
 }
@@ -126,6 +146,13 @@ func (m *manager) monitorProcess() {
 	reason := ExitReasonAbnormal
 	if m.restartFlag {
 		reason = ExitReasonRestart
+		logger.Debug("Process exited due to restart request")
+	} else {
+		if err != nil {
+			logger.Info("Child process exited abnormally: %v", err)
+		} else {
+			logger.Info("Child process exited normally")
+		}
 	}
 
 	m.exitChan <- exitInfo{
