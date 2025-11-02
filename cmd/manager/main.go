@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/zlrrr/flush-manager/internal/logger"
 	"github.com/zlrrr/flush-manager/internal/manager"
 )
 
@@ -29,6 +30,9 @@ func main() {
 		os.Exit(0)
 	}
 
+	logger.Info("=== Flush Manager v%s starting ===", Version)
+	logger.Info("PID: %d", os.Getpid())
+
 	// Get additional args to pass to the child process
 	args := flag.Args()
 
@@ -38,14 +42,16 @@ func main() {
 		ConfigFilePath: *configFile,
 	}
 
+	logger.Info("Configuration: command=%s, config_file=%s, args=%v", *command, *configFile, args)
+
 	m, err := manager.New(config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create manager: %v\n", err)
-		os.Exit(1)
+		logger.Fatal("Failed to create manager: %v", err)
 	}
 
 	if err := m.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Manager error: %v\n", err)
-		os.Exit(1)
+		logger.Fatal("Manager error: %v", err)
 	}
+
+	logger.Info("Manager exiting normally")
 }

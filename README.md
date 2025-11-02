@@ -67,11 +67,116 @@ CMD ["-command", "/usr/local/bin/your-app"]
 
 1. **Process Management**: The manager starts the specified child process and monitors its lifecycle
 2. **Configuration Watching**: If a configuration file path is provided and the file exists, the manager watches for file modifications
+   - Uses fsnotify for real-time file system events
+   - Includes polling fallback (every 5 seconds) for reliable detection
+   - Handles Kubernetes ConfigMap updates via symlink/inode tracking
 3. **Automatic Restart**: When the configuration file changes, the manager gracefully restarts the child process
 4. **Exit Handling**:
    - If the child process exits abnormally, the manager also exits
    - If the manager restarts the child process, it continues running
 5. **Signal Handling**: The manager catches SIGTERM/SIGINT and performs graceful shutdown
+
+## Logging
+
+All log messages are prefixed with `[flush-manager]` to make them easy to identify in combined logs. The manager logs at different levels:
+
+- **INFO**: Important operational messages (startup, shutdown, config changes, process lifecycle)
+- **ERROR**: Error conditions
+- **DEBUG**: Detailed diagnostic information (file system events, internal state)
+
+Example log output:
+```
+[flush-manager] INFO: === Flush Manager v1.0.0 starting ===
+[flush-manager] INFO: PID: 1
+[flush-manager] INFO: Configuration: command=/usr/local/bin/redis-exporter, config_file=/usr/local/bin/conf/exporter.conf
+[flush-manager] INFO: Config file /usr/local/bin/conf/exporter.conf is a symlink pointing to /usr/local/bin/conf/..data/exporter.conf
+[flush-manager] INFO: Watching directory: /usr/local/bin/conf
+[flush-manager] INFO: Starting child process: /usr/local/bin/redis-exporter []
+[flush-manager] INFO: Child process started with PID: 123
+[flush-manager] INFO: File change detected: old_inode=456, new_inode=789
+[flush-manager] INFO: Config file change detected, restarting child process...
+```
+
+## Kubernetes ConfigMap Support
+
+The manager is specifically designed to work with Kubernetes ConfigMap mounts:
+
+### How ConfigMaps Are Mounted
+
+Kubernetes mounts ConfigMaps using symlinks:
+```
+/usr/local/bin/conf/
+├── exporter.conf -> ..data/exporter.conf (symlink to file)
+├── ..data -> ..2023_11_02_12_00_00.123456789 (symlink to directory)
+└── ..2023_11_02_12_00_00.123456789/
+    └── exporter.conf (actual file)
+```
+
+When you update a ConfigMap, Kubernetes:
+1. Creates a new timestamped directory with updated files
+2. Atomically updates the `..data` symlink
+3. Eventually removes old directories
+
+### How the Manager Handles This
+
+1. **Symlink Detection**: On startup, detects if the config file is a symlink
+2. **Multi-Level Watching**: Watches both the file and parent directories
+3. **Inode Tracking**: Detects when symlink target changes (inode changes)
+4. **Polling Fallback**: Checks every 5 seconds to ensure changes aren't missed
+5. **Debouncing**: Waits 500ms after last change to avoid multiple restarts
+
+### Example in Kubernetes
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-exporter
+spec:
+  containers:
+  - name: exporter
+    image: your-registry/redis-exporter:latest
+    command: ["/usr/local/bin/manager"]
+    volumeMounts:
+    - name: config
+      mountPath: /usr/local/bin/conf
+  volumes:
+  - name: config
+    configMap:
+      name: redis-exporter-config
+```
+
+When you run `kubectl edit configmap redis-exporter-config`, the manager will:
+1. Detect the ConfigMap update within 5 seconds (or instantly via fsnotify)
+2. Log the change with old and new inode numbers
+3. Gracefully restart the redis-exporter process
+4. Continue running normally
+
+## Troubleshooting
+
+If the manager is not detecting config file changes, check:
+
+1. **Verify file watcher started:**
+   ```bash
+   kubectl logs <pod-name> | grep "Starting file watcher"
+   ```
+
+2. **Check for change detection:**
+   ```bash
+   kubectl logs <pod-name> | grep "File change detected"
+   ```
+
+3. **Monitor fsnotify events (debug):**
+   ```bash
+   kubectl logs <pod-name> | grep "Fsnotify event"
+   ```
+
+4. **Verify polling is active:**
+   ```bash
+   kubectl logs <pod-name> | grep "polling"
+   ```
+
+For detailed troubleshooting, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 
 ## Architecture
 
@@ -96,7 +201,7 @@ The project is structured into three main components:
 
 ### Prerequisites
 
-- Go 1.19 or later
+- Go 1.13 or later (tested with Go 1.13 - 1.23)
 
 ### Running Tests
 
@@ -119,6 +224,8 @@ flush-manager/
 │   └── manager/          # Main application entry point
 │       └── main.go
 ├── internal/
+│   ├── logger/           # Logging utilities
+│   │   └── logger.go
 │   ├── manager/          # Core manager logic
 │   │   ├── manager.go
 │   │   └── manager_test.go
@@ -132,7 +239,8 @@ flush-manager/
 ├── go.sum
 ├── Makefile
 ├── LICENSE
-└── README.md
+├── README.md
+└── TROUBLESHOOTING.md
 ```
 
 ## Testing
